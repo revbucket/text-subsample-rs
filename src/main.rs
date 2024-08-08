@@ -2,7 +2,8 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use rand::Rng;
-use dashmap::{DashMap, DashSet};
+use rand::seq::SliceRandom;
+use dashmap::{DashMap};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::BufRead;
 
@@ -11,7 +12,7 @@ use clap::{Parser, Subcommand};
 use anyhow::{Result, Error};
 use std::time::Instant;
 use serde_json::Value;
-use std::path::{PathBuf};
+use std::path::{PathBuf, Path};
 use serde::{Deserialize, Serialize};
 use rayon::prelude::*;
 use crate::io::{expand_dirs, read_pathbuf_to_mem, write_mem_to_pathbuf, get_output_filename, has_json_extension};
@@ -24,6 +25,7 @@ pub mod s3;
 pub mod io;
 
 const SIG_CHUNK_SIZE: usize = 100 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = 100 * 1000; // No more than 100k documents in a single file
 
 /*=================================================================
 =                                  ARGS                           =
@@ -79,9 +81,10 @@ enum Commands {
         max_size: usize,
 
         #[arg(long, default_value_t=false)]
-        nodup: bool
+        nodup: bool,
 
-
+        #[arg(long, default_value_t=false)]
+        copy: bool
     }
 }
 
@@ -102,6 +105,30 @@ fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
     pbar
 }
 
+
+fn get_cur_output(path: PathBuf, part: usize) -> PathBuf {
+    if part == 0 {
+        return path
+    }
+
+    let file_name = path.file_name().unwrap_or_default().to_str().unwrap_or("");
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let insert = format!("_part{:04}", part);
+
+    let (base, ext) = if file_name.ends_with(".jsonl.gz") {
+        (&file_name[..file_name.len() - 8], ".jsonl.gz")
+    } else if file_name.ends_with(".jsonl.zstd") {
+        (&file_name[..file_name.len() - 10], ".jsonl.zstd")
+    } else if file_name.ends_with(".jsonl.zst") {
+        (&file_name[..file_name.len() - 9], ".jsonl.zst")
+    } else if file_name.ends_with(".jsonl") {
+        (&file_name[..file_name.len() - 6], ".jsonl")
+    } else {
+        (file_name, "")
+    };
+    let new_file_name = format!("{}{}{}", base, insert, ext);
+    parent.join(new_file_name)
+}
 
 
 /*=================================================================
@@ -257,6 +284,7 @@ fn build_profile(groups: &DashMap<usize, Vec<Vec<(usize, usize)>>>) -> HashMap<u
 
 fn subsample_groups(groups: DashMap<usize, Vec<Vec<(usize, usize)>>>, ratio: f64, max_size: usize, nodup: bool) 
 -> DashMap<usize, Vec<Vec<(usize, usize)>>> {
+    // Takes the groups which maps {cc_size: [cc1, cc2, ...]} into a subsampling
     let flat_groups: Vec<Vec<(usize, usize)>> = groups
         .into_par_iter()
         .flat_map(|(_, v)| v)
@@ -267,13 +295,14 @@ fn subsample_groups(groups: DashMap<usize, Vec<Vec<(usize, usize)>>>, ratio: f64
     flat_groups.into_par_iter()
         .for_each(|g| {
             let mut rng = rand::thread_rng();
-            if nodup {
+            if nodup { // Regular subsampling
                 let new_group: Vec<(usize, usize)> = g.iter()
                     .filter(|_| rng.gen_bool(ratio))
                     .cloned()
                     .collect();
                 subsampled_groups.entry(new_group.len()).or_default().push(new_group)
             } else if g.len() <= max_size && rng.gen_bool(ratio) {
+                // duplicate aware subsampling
                 subsampled_groups.entry(g.len()).or_default().push(g)    
             }
             pbar.inc(1);
@@ -283,9 +312,9 @@ fn subsample_groups(groups: DashMap<usize, Vec<Vec<(usize, usize)>>>, ratio: f64
 
 }
 
-fn collect_survivors(groups: DashMap<usize, Vec<Vec<(usize, usize)>>>) -> DashMap<usize, DashSet<usize>> {
-    // Maps surviving groups into a {doc_id -> set(line_num,...)}
-    let survivors: DashMap<usize, DashSet<usize>> = DashMap::new();
+fn collect_survivors(groups: DashMap<usize, Vec<Vec<(usize, usize)>>>, copy: bool) -> DashMap<usize, DashMap<usize, usize>> {
+    // Maps surviving groups into a {doc_id -> {line_num: freq}}
+    let survivors: DashMap<usize, DashMap<usize, usize>> = DashMap::new();
 
     let flat_groups: Vec<Vec<(usize, usize)>> = groups
         .into_par_iter()
@@ -295,8 +324,15 @@ fn collect_survivors(groups: DashMap<usize, Vec<Vec<(usize, usize)>>>) -> DashMa
     let pbar = build_pbar(flat_groups.len(), "Groups (survivors)");
     flat_groups.into_par_iter()
         .for_each(|g| {
-            for (doc_id, line_num) in g {
-                survivors.entry(doc_id).or_default().insert(line_num);
+            if !copy {
+                for (doc_id, line_num) in g {
+                    survivors.entry(doc_id).or_default().insert(line_num, 1);
+                }
+            } else {
+                let mut rng = rand::thread_rng();
+                if let Some((doc_id, line_num)) = g.choose(&mut rng) {
+                    survivors.entry(*doc_id).or_default().insert(*line_num, g.len());
+                }
             }
         pbar.inc(1);
         });
@@ -305,7 +341,9 @@ fn collect_survivors(groups: DashMap<usize, Vec<Vec<(usize, usize)>>>) -> DashMa
 }
 
 
-fn scrub_dataset(config: Config, lines_to_survive: DashMap<usize, DashSet<usize>>, output: &PathBuf) -> Result<(usize, usize), Error> {
+
+
+fn scrub_dataset(config: Config, lines_to_survive: DashMap<usize, DashMap<usize, usize>>, output: &PathBuf) -> Result<(usize, usize), Error> {
     let documents_seen = AtomicUsize::new(0);
     let documents_removed = AtomicUsize::new(0);
     let pbar = build_pbar(lines_to_survive.len(), "Paths");
@@ -322,28 +360,40 @@ fn scrub_dataset(config: Config, lines_to_survive: DashMap<usize, DashSet<usize>
     Ok((documents_seen.into_inner(), documents_removed.into_inner()))
 }
 
-fn keep_survivors(input_filename: &PathBuf, output_filename: &PathBuf, survivors: DashSet<usize>) -> Result<(usize, usize), Error> {
+fn keep_survivors(input_filename: &PathBuf, output_filename: &PathBuf, survivors: DashMap<usize, usize>) -> Result<(usize, usize), Error> {
     let data = read_pathbuf_to_mem(input_filename).unwrap();
-    let mut lines_seen = 0;
+    let mut lines_kept = 0;
     let mut lines_removed = 0;
     let mut output_bytes = Vec::new();
     let mut line_num = 0;
+    let mut file_part = 0;
+    let mut cur_output = get_cur_output(output_filename.clone(), file_part);
+    let mut cur_lines = 0;
     for line in data.lines() {
         let line = line?;
-        lines_seen += 1;
-        if survivors.contains(&line_num) {
+        let freq: usize = survivors.get(&line_num).map(|r| *r).unwrap_or(0);
+        for _ in 0..freq {
             output_bytes.extend(line.as_bytes());
-            output_bytes.push(b'\n');            
-        } else {
+            output_bytes.push(b'\n');                  
+            cur_lines += 1;
+            lines_kept += 1;
+            if cur_lines >= MAX_FILE_SIZE {
+                write_mem_to_pathbuf(&output_bytes, &cur_output).unwrap();
+                cur_lines = 0;
+                file_part += 1;
+                cur_output =get_cur_output(output_filename.clone(), file_part);
+            }          
+        } 
+        if freq == 0 {
             lines_removed += 1;
         }
         line_num += 1;
     }
     if output_bytes.len() == 0 {
-        return Ok((lines_seen, lines_removed))
+        return Ok((lines_kept, lines_removed))
     }
-    write_mem_to_pathbuf(&output_bytes, output_filename).unwrap();
-    Ok((lines_seen, lines_removed))
+    write_mem_to_pathbuf(&output_bytes, &cur_output).unwrap();
+    Ok((lines_kept, lines_removed))
 }
 
 
@@ -406,7 +456,7 @@ fn build_exact(config: &PathBuf, output: &PathBuf) -> Result<(), Error> {
 }
 
 
-fn subsample(config: &PathBuf, sig_loc: &PathBuf, output: &PathBuf, ratio: f64, max_size: usize, nodup: bool) 
+fn subsample(config: &PathBuf, sig_loc: &PathBuf, output: &PathBuf, ratio: f64, max_size: usize, nodup: bool, copy: bool) 
 -> Result<(), Error> {
     println!("Starting subsample");
     let start_main = Instant::now();
@@ -435,7 +485,7 @@ fn subsample(config: &PathBuf, sig_loc: &PathBuf, output: &PathBuf, ratio: f64, 
     // Step 4: Collect survivor lines
     println!("Collecting survivors");
     let start_survivors = Instant::now();
-    let survivors = collect_survivors(subsampled_groups);
+    let survivors = collect_survivors(subsampled_groups, copy);
     println!("Collected survivors rin {:?} (s)", start_survivors.elapsed().as_secs());
 
     // Step 5: Modify dataset 
@@ -463,6 +513,8 @@ fn subsample(config: &PathBuf, sig_loc: &PathBuf, output: &PathBuf, ratio: f64, 
     return Ok(());        
 }
 
+
+
 /*=================================================================
 =                                 MAIN                            =
 =================================================================*/
@@ -484,9 +536,9 @@ fn main() {
             build_exact(config, output)
         },
 
-        Commands::Subsample {config, sig_loc, output, ratio, max_size, nodup} => {
-            subsample(config, sig_loc, output, *ratio, *max_size, *nodup)
-        }
+        Commands::Subsample {config, sig_loc, output, ratio, max_size, nodup, copy} => {
+            subsample(config, sig_loc, output, *ratio, *max_size, *nodup, *copy)
+        },
         _ => {Ok(())}
     };
 
