@@ -77,7 +77,7 @@ enum Commands {
         #[arg(required=true, long)]
         ratio: f64,
 
-        #[arg(required=true, long, default_value_t=usize::MAX)]
+        #[arg(long, default_value_t=usize::MAX)]
         max_size: usize,
 
         #[arg(long, default_value_t=false)]
@@ -116,11 +116,11 @@ fn get_cur_output(path: PathBuf, part: usize) -> PathBuf {
     let insert = format!("_part{:04}", part);
 
     let (base, ext) = if file_name.ends_with(".jsonl.gz") {
-        (&file_name[..file_name.len() - 8], ".jsonl.gz")
+        (&file_name[..file_name.len() - 9], ".jsonl.gz")
     } else if file_name.ends_with(".jsonl.zstd") {
-        (&file_name[..file_name.len() - 10], ".jsonl.zstd")
+        (&file_name[..file_name.len() - 11], ".jsonl.zstd")
     } else if file_name.ends_with(".jsonl.zst") {
-        (&file_name[..file_name.len() - 9], ".jsonl.zst")
+        (&file_name[..file_name.len() - 10], ".jsonl.zst")
     } else if file_name.ends_with(".jsonl") {
         (&file_name[..file_name.len() - 6], ".jsonl")
     } else {
@@ -382,6 +382,7 @@ fn keep_survivors(input_filename: &PathBuf, output_filename: &PathBuf, survivors
                 cur_lines = 0;
                 file_part += 1;
                 cur_output =get_cur_output(output_filename.clone(), file_part);
+                output_bytes = Vec::new();
             }          
         } 
         if freq == 0 {
